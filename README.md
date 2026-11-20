@@ -1,6 +1,6 @@
 # Helpr
 
-**Helpr — Your Personal Security Helper** is a modular, Proxy-only Burp Suite extension built with Java and the Montoya API.
+**Helpr — Your Personal Security Helper** is a modular, Proxy-only Burp Suite extension built with Java and the Montoya API. It observes eligible traffic captured by Burp Proxy and runs selected security tests against the captured requests.
 
 ## Requirements
 
@@ -20,94 +20,149 @@ Set-ExecutionPolicy -Scope Process Bypass
 .\build.ps1
 ```
 
-The script downloads `montoya-api-2026.7.jar` into `lib/` if it is not already present, compiles the source against Java 21, and creates `dist\helpr.jar`.
+The build script downloads `montoya-api-2026.7.jar` into `lib/` if it is not already present, compiles the source for Java 21, and creates `dist\helpr.jar`.
 
-## Load in Burp
+## Load in Burp Suite
 
 1. Open **Extensions → Installed → Add**.
 2. Select **Java** as the extension type.
 3. Choose `dist\helpr.jar`.
 4. Open the **Helpr** suite tab.
-5. Enable monitoring when ready.
+5. Select the desired test cases and configure their options.
+6. Enable monitoring when ready to browse the target application.
 
-## Proxy-history-driven testing
+## How traffic is processed
 
-- Helpr registers Burp Proxy request and response handlers only. Repeater, Intruder, Scanner, and other tool traffic do not seed tests.
-- A test context is created only after Helpr observes a completed, in-scope Proxy request/response exchange while monitoring is enabled and after exclusions are checked. This is the source traffic represented in Burp Proxy HTTP history; Helpr does not crawl, discover, or independently seed endpoint URLs.
-- Each test module starts from that captured Proxy request. It creates a modified copy when needed and sends the replay through Montoya's HTTP API.
-- Replays are sent outside the Proxy listener, so they do not recursively trigger Helpr or become new Proxy-history seeds. Burp may show API-generated traffic in other applicable logging views, but Helpr does not treat its own replays as new input.
-- The original Proxy request and response are retained unchanged as evidence. Every test result stores the original pair and its own modified/replayed request and response.
-- Requests already admitted while Helpr was ON are completed even if monitoring is switched OFF before the response arrives.
-- Burp Target Scope is used directly; Helpr does not implement a second scope system.
-- Endpoint exclusions and ignored file extensions are checked before test scheduling. Static resources such as `.css`, `.js`, `.png`, `.svg`, `.ttf`, `.woff`, and `.woff2` are ignored by default. The extension list is configurable.
-- Original Proxy messages are never modified.
-- No deduplication is performed during collection or test execution. Every eligible completed Proxy exchange is passed independently to each enabled test module.
+- Helpr registers Burp Proxy request and response handlers. Repeater, Intruder, Scanner, and other tool traffic do not seed tests.
+- A test context is created from a completed, in-scope Proxy request/response exchange observed while monitoring is enabled, after endpoint exclusions and ignored-extension filters are applied.
+- Helpr does not crawl the application or independently discover endpoint URLs. Captured Proxy traffic is the source of endpoint and request data.
+- Each enabled test module receives the captured request as its starting point. Modules may analyse it directly or create a modified copy for a test replay.
+- Test replays use the Montoya HTTP API rather than the Proxy listener, preventing Helpr's own replays from recursively becoming new Proxy inputs.
+- The original Proxy request and response are retained unchanged. Test results retain the original exchange and the relevant test request/response evidence.
+- Requests admitted while monitoring is enabled are allowed to complete even if monitoring is disabled before the response arrives.
+- Burp Target Scope is used directly; Helpr does not maintain a separate scope configuration.
+- No deduplication is performed during traffic collection or test execution. Repeated eligible Proxy exchanges can therefore produce repeated test executions. Report-generation options control how those results are exported.
 
-## Initial test modules
+## Test cases
 
-### Missing Authentication
+The Test Cases tab contains selectable test modules. The currently implemented modules are described below.
 
-- Uses each eligible captured Proxy request as its starting point.
-- Removes the configured header names from a derived request (defaults: `Authorization`, `Cookie`, `X-Auth-Token`).
-- Replays the modified request and records the original and replayed HTTP evidence.
+### 1. Missing Authentication
 
-### HTTP Methods
+- Starts with each eligible captured Proxy request.
+- Removes the configured authentication header names from a derived request and replays it.
+- Default authentication header names are `Authorization`, `Cookie`, and `X-Auth-Token`.
+- The shared **Exclude Headers** configuration controls which headers this test removes.
+- The original request is not modified. The original and unauthenticated replay evidence are retained in the result.
 
-- Probes configured methods against the endpoint from the captured Proxy request.
-- OPTIONS, GET and HEAD are enabled by default.
-- POST, PUT, PATCH, DELETE, TRACE and CONNECT are opt-in.
-- State-changing method probes may reuse the captured body. Enable them only when the target and operation are safe and authorized.
+### 2. HTTP Methods
+
+HTTP Methods is one selectable test case. It probes the configured methods against the endpoint represented by the captured Proxy request.
+
+- `OPTIONS`, `GET`, and `HEAD` are enabled by default.
+- `POST`, `PUT`, `PATCH`, `DELETE`, `TRACE`, and `CONNECT` are opt-in.
+- For `OPTIONS`, the configured test condition is identified when the response is successful and includes an `Allow` header. A successful response without `Allow`, or an HTTP `405` / `501`, is classified as False. No response is Undetermined.
+- For other methods, a `2xx` or `3xx` response identifies that the method responded; `405` / `501` indicates rejection; other responses may be Undetermined.
+- When an opt-in state-changing method is enabled, Helpr may reuse the captured request body. Enable these methods only when the target and operation are safe and authorized.
+- In the HTML report, all method checks are grouped under one collapsible **HTTP Methods — target-host** entry. Each method has its own status and request/response evidence.
+
+### 3. CORS Misconfiguration
+
+CORS is one selectable test case. Its individual checks are grouped under one collapsible **CORS Misconfiguration — target-host** entry in the HTML report.
+
+The current checks are:
+
+- **Arbitrary / Wildcard Origin Acceptance** — sends an untrusted origin (`https://helpr-untrusted-origin.invalid`) and checks whether the response returns `Access-Control-Allow-Origin: *` or reflects that exact untrusted origin.
+- **Credentialed CORS with Untrusted Origin** — reuses the untrusted-origin probe and checks whether the exact untrusted origin is reflected together with `Access-Control-Allow-Credentials: true`. A wildcard response does not satisfy this check.
+- **Null Origin Acceptance** — sends `Origin: null` and checks whether the response explicitly allows `null`.
+- **Improper Subdomain Trust** — derives candidate origins from the actual endpoint host and checks a candidate subdomain, a deceptive suffix, and a substring-lookalike origin. The report lists these as separate sub-checks.
+- **Insecure CORS Cache Handling** — checks whether an untrusted origin is dynamically reflected without `Vary: Origin`. This is an indicator requiring confirmation of shared-cache behaviour; it is not, by itself, proof of exploitable cache impact.
+
+CORS probes are currently limited to captured `GET` and `HEAD` requests. Other captured methods produce an Undetermined result indicating that the probes were skipped to avoid replaying state-changing requests. Preflight Policy and Exposed Response Headers are not separate checks in the current implementation.
+
+CORS acceptance indicators are not automatically proof of a vulnerability. Review the endpoint's sensitivity, browser credential behaviour, origin trust requirements, and complete HTTP evidence before drawing conclusions.
+
+### 4. HTTP Header Manipulation
+
+- Enable **HTTP Header Manipulation** to replay each configured **Include Headers** entry as an independent request against each eligible captured Proxy exchange.
+- Configure one `Header-Name: value` entry per line. For example:
+
+  ```http
+  Accept: text/plain
+  Accept: application/json
+  Accept: application/xml
+  ```
+
+  These entries generate three separate replays. They are not combined into one request containing multiple configured values.
+- Each replay starts from the unchanged original request and applies the configured header variant. Other original headers and the request body are retained.
+- Each replay has its own request/response evidence and standard test status.
+- An empty Include Headers list means there are no header variants to send.
+
+## Configuration
+
+The **Configuration** tab contains these sections:
+
+### Endpoint Exclusions
+
+- Add one URL path pattern per line, for example `/api/auth/*`.
+- Wildcard `*` and single-character `?` matching are supported.
+- Matching requests are skipped by all test modules.
+
+### Ignored Extensions
+
+- Configure one file extension per line.
+- Common static resources are ignored by default, including `.css`, `.js`, image formats, `.map`, `.woff`, `.woff2`, `.ttf`, and `.eot`.
+- Matching requests continue through Burp normally but are skipped by Helpr's test scheduling.
+
+### Headers
+
+The shared header configuration contains:
+
+- **Include Headers** — header name/value variants used by HTTP Header Manipulation.
+- **Exclude Headers** — header names removed by Missing Authentication and other applicable tests.
+
+Configuration is stored in `~/.helpr.properties`.
 
 ## HTML report
 
-- The report contains **Security Findings / Test Results only**. It does not include a separate captured Proxy traffic history section.
-- Results are grouped endpoint-first by original HTTP method + host (including port) + exact path. Query strings do not split endpoint groups; different HTTP methods remain separate.
-- Endpoint groups are collapsed by default. Test cases inside them are also collapsed by default. HTTP evidence is shown only after expanding the relevant endpoint and test case.
-- Each test case includes the complete original request/response, modified/replayed request/response, timestamp, status, and observation.
-- The report duplicate option affects exported evidence only. It does not deduplicate or delete collected traffic or test executions.
+Helpr generates an HTML report containing **Security Findings / Test Results**. It does not include a separate captured Proxy traffic history section.
 
-## Configuration and evidence
+### Report hierarchy
 
-- Configuration is stored in `~/.helpr.properties`.
-- Session evidence is held in memory. Export reports periodically during large assessments.
-- The **Clear Evidence** action clears current-session evidence.
-- HTML reports may contain credentials, cookies, tokens, and personal data. Store and share them securely.
-- Detection labels are automated indicators, not confirmed vulnerabilities. Review the complete evidence manually.
+- Results are grouped endpoint-first by original HTTP method, host (including port), and exact path.
+- Query strings do not split endpoint groups. Different original HTTP methods remain separate endpoints.
+- Endpoint groups are collapsed by default.
+- CORS and HTTP Methods each appear as one collapsible test case under the endpoint.
+- Individual CORS checks and HTTP method checks are nested inside their parent test case. Each nested check has its own status and expandable HTTP evidence.
+- Other test modules appear as their own collapsible test-case entries.
+- HTTP evidence includes the original request/response and the test request/response, together with timestamp, status, and observation.
 
-## Safety
+### Unique results versus all executions
 
-Use Helpr only against systems for which you have authorization. POST, PUT, PATCH, DELETE, TRACE, and CONNECT probes are opt-in because they can have side effects.
+When generating a report, Helpr displays **Generate all results (include repeated test executions)**. It is unchecked by default.
 
+- **Unchecked (default):** include the first recorded result for each endpoint and named test check. This produces a concise report without repeated executions.
+- **Checked:** include every execution and its evidence, including repeated visits to the same endpoint.
+- This option affects report output only. It does not delete, deduplicate, or alter captured traffic or in-memory test results.
+- The status shown on a collapsed test/check row reflects the latest execution included in the report. Expand the row to inspect the included evidence.
 
-## Global test result classification
+## Result classification
 
-Every current and future test module must return exactly one `TestStatus` value:
+Every test module uses exactly three result statuses:
 
-- `TRUE` — sufficient evidence that the tested security issue exists.
-- `FALSE` — the test completed and did not detect the issue.
-- `UNDETERMINED` — evidence is insufficient for a reliable conclusion.
+- **True** — sufficient evidence that the tested condition was identified. This does not necessarily mean the condition is a confirmed vulnerability.
+- **False** — the test completed and the tested condition was not identified.
+- **Undetermined** — there was insufficient evidence for a reliable conclusion, or the probe could not be completed.
 
-`TestResult.status` is an enum rather than a free-form string, preventing modules from introducing additional labels. A successful HTTP status or an `Allow` header alone must not be treated as proof of a vulnerability.
+A successful HTTP response or an `Allow` header alone must not be treated as proof of a vulnerability. Interpret each result according to its test objective and review the associated evidence.
 
+## Evidence and session handling
 
-### HTML report status display
+- Captured traffic and test evidence are held in memory for the current Helpr session.
+- Use **Clear Evidence** to clear current-session captured traffic and test results.
+- Export reports periodically during large assessments if you need to retain evidence.
+- HTML reports may contain credentials, cookies, tokens, personal data, and other sensitive information. Store and share them securely.
 
-Each collapsed security test-case row displays one status badge (True, False, or Undetermined) next to the test-case name. Execution-count labels are omitted from endpoint and test-case headings. When duplicate executions are included, the row badge reflects the latest included execution; individual execution evidence remains expandable below it. The overall report summary retains the True, False, and Undetermined totals.
+## Safety and authorization
 
-## Shared header inputs and HTTP Header Manipulation
-
-The Test Cases tab contains shared **Include Headers** and **Exclude Headers** inputs.
-
-- Enable **HTTP Header Manipulation** to replay each configured Include Headers line as an independent request against every eligible captured Proxy exchange.
-- Use one `Header-Name: value` entry per line. For example, `Accept: text/plain` and `Accept: application/json` generate two separate replays from the same original captured request; values are never combined into a single request.
-- Each replay starts from the unchanged original request and replaces/adds only the configured header for that variant. Other original headers and the request body are retained.
-- The **Exclude Headers** list is shared with tests that need to remove headers. Missing Authentication uses it to remove configured authentication headers from its cloned request.
-- The two panels are saved together using **Save Shared Header Inputs**. An empty Include Headers list means the HTTP Header Manipulation test has no variants to send.
-- Every replay stores its own request/response evidence and receives the standard True / False / Undetermined result.
-
-Header manipulation is now a selectable test case; it is not a separate manual request picker or Replay button.
-
-
-## UI layout update
-
-The suite tab now has three top-level tabs: Dashboard, Test Cases, and Configuration. Configuration contains nested sections for Request / Response inspection, Endpoint Exclusions, Ignored Extensions, and shared Header Inputs. The Request / Response section lists captured Proxy exchanges and displays the selected original request and response; this traffic viewer is not added to the HTML report.
+Use Helpr only against systems for which you have explicit authorization. State-changing HTTP method probes are opt-in and may reuse the captured request body. Review the target and request before enabling them. Automated test statuses are indicators; validate findings manually before reporting them.
